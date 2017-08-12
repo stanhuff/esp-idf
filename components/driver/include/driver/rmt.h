@@ -673,6 +673,42 @@ esp_err_t rmt_driver_uninstall(rmt_channel_t channel);
 esp_err_t rmt_write_items(rmt_channel_t channel, const rmt_item32_t* rmt_item, int item_num, bool wait_tx_done);
 
 /**
+ * @brief RMT send waveform from byte array.
+ *
+ *        This API allows user to send waveform with any length.
+ *
+ * @param channel RMT channel (0 - 7)
+ *
+ * @param bytes head pointer of RMT byte array.  Rather than sending items, each bit of each byte
+ * will select one of two items to be sent.  One for a high bit 1 and one for a low bit 0. Bytes are
+ * most significant bit first.
+ *
+ * @param byte_count Number of bytes to send.
+ *
+ * @param low The item to send for 0 (low) bits
+ *
+ * @param high The item to send for 1 (high) bits
+ *
+ * @param wait_tx_done If set 1, it will block the task and wait for sending done.
+ *
+ *                     If set 0, it will not wait and return immediately.
+ *
+ *                     @note
+ *                     This function will not copy data, instead, it will point to the original bytes,
+ *                     and generate and send the waveform items on demand.
+ *                     If wait_tx_done is set to true, this function will block and will not return until
+ *                     all items have been sent out.
+ *                     If wait_tx_done is set to false, this function will return immediately, and the driver
+ *                     interrupt will continue sending the items. We must make sure the item data will not be
+ *                     damaged when the driver is still sending items in driver interrupt.
+ *
+ * @return
+ *     - ESP_ERR_INVALID_ARG Parameter error
+ *     - ESP_OK Success
+ */
+ esp_err_t rmt_write_bytes(rmt_channel_t channel, const uint8_t * bytes, int byte_count, rmt_item32_t low, rmt_item32_t high,  bool wait_tx_done);
+
+/**
  * @brief Wait RMT TX finished.
  *
  * @param channel RMT channel (0 - 7)

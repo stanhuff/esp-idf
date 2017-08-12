@@ -71,6 +71,9 @@ typedef struct {
     xSemaphoreHandle tx_sem;
     RingbufHandle_t tx_buf;
     RingbufHandle_t rx_buf;
+    const uint8_t* tx_byteData;
+    rmt_item32_t tx_byteLow;
+    rmt_item32_t tx_byteHigh;
 } rmt_obj_t;
 
 rmt_obj_t* p_rmt_obj[RMT_CHANNEL_MAX] = {0};
@@ -481,6 +484,38 @@ static void IRAM_ATTR rmt_fill_memory(rmt_channel_t channel, const rmt_item32_t*
     }
 }
 
+static void IRAM_ATTR rmt_fill_byte_memory(rmt_channel_t channel, const uint8_t* bytes, uint16_t byte_count, uint16_t mem_offset, rmt_item32_t low, rmt_item32_t high) {
+    portENTER_CRITICAL(&rmt_spinlock);
+    RMT.apb_conf.fifo_mask = RMT_DATA_MODE_MEM;
+    portEXIT_CRITICAL(&rmt_spinlock);
+
+    /*
+    int i;
+    for (i = 0; i < byte_count * 8; ++i) {
+        RMTMEM.chan[channel].data32[mem_offset + i].val = high.val;
+    }
+    */
+
+    int i;
+    for (i = 0; i < byte_count; ++i) {
+        int offset = mem_offset + (i << 3);
+        uint8_t byte = *bytes;
+        //ESP_EARLY_LOGD(RMT_TAG, "Write Byte %d", (int)byte);
+        bytes++;
+        int bit;
+        for (bit = 0x80; bit; bit >>= 1, ++offset) {
+            if (byte & bit) {
+                //ESP_EARLY_LOGD(RMT_TAG, "High item @ %d durations %d, %d", offset, high.duration0, high.duration1);
+                RMTMEM.chan[channel].data32[offset].val = high.val;
+            }
+            else {
+                //ESP_EARLY_LOGD(RMT_TAG, "Low item @ %d durations %d, %d", offset, low.duration0, low.duration1);
+                RMTMEM.chan[channel].data32[offset].val = low.val;
+            }
+        }
+    }    
+}
+
 esp_err_t rmt_fill_tx_items(rmt_channel_t channel, const rmt_item32_t* item, uint16_t item_num, uint16_t mem_offset)
 {
     RMT_CHECK(channel < RMT_CHANNEL_MAX, RMT_CHANNEL_ERROR_STR, (0));
@@ -544,6 +579,7 @@ static void IRAM_ATTR rmt_driver_isr_default(void* arg)
                             portYIELD_FROM_ISR();
                         }
                         p_rmt->tx_data = NULL;
+                        //p_rmt->tx_byteData = NULL;
                         p_rmt->tx_len_rem = 0;
                         p_rmt->tx_offset = 0;
                         p_rmt->tx_sub_len = 0;
@@ -590,7 +626,36 @@ static void IRAM_ATTR rmt_driver_isr_default(void* arg)
                 RMT.int_clr.val = BIT(i);
                 ESP_EARLY_LOGD(RMT_TAG, "RMT CH[%d]: EVT INTR", channel);
                 if(p_rmt->tx_data == NULL) {
-                    //skip
+                    // here transmit input is bytes rather than rmt_items. Note we reuse 
+                    // all the same tx state as if transmitting by item.
+                    if (p_rmt->tx_byteData) {
+                        //ESP_EARLY_LOGD(RMT_TAG, "dealing with bytes");
+                        const uint8_t * pdata = p_rmt->tx_byteData;
+                        int len_rem = p_rmt->tx_len_rem;    
+                        if(len_rem >= p_rmt->tx_sub_len) {
+                            int byteLen = p_rmt->tx_sub_len >> 3;
+                            rmt_fill_byte_memory(channel, pdata, byteLen, p_rmt->tx_offset, p_rmt->tx_byteLow, p_rmt->tx_byteHigh);
+                            p_rmt->tx_byteData += byteLen; // adjust data by number of bytes sent
+                            p_rmt->tx_len_rem -= p_rmt->tx_sub_len;
+                        } else if(len_rem == 0) {
+                            RMTMEM.chan[channel].data32[p_rmt->tx_offset].val = 0;
+                        } else {
+                            int byteLen = len_rem >> 3;
+                            rmt_fill_byte_memory(channel, pdata, byteLen, p_rmt->tx_offset, p_rmt->tx_byteLow, p_rmt->tx_byteHigh);
+                            RMTMEM.chan[channel].data32[p_rmt->tx_offset + len_rem].val = 0;
+                            p_rmt->tx_byteData += byteLen;
+                            p_rmt->tx_len_rem -= len_rem;
+                            p_rmt->tx_byteData = NULL;
+                        }
+                        if(p_rmt->tx_offset == 0) {
+                            p_rmt->tx_offset = p_rmt->tx_sub_len;
+                        } else {
+                            p_rmt->tx_offset = 0;
+                        }
+                    }
+                    else {
+                        //skip
+                    }
                 } else {
                     const rmt_item32_t* pdata = p_rmt->tx_data;
                     int len_rem = p_rmt->tx_len_rem;
@@ -737,6 +802,48 @@ esp_err_t rmt_write_items(rmt_channel_t channel, const rmt_item32_t* rmt_item, i
         p_rmt->tx_sub_len = item_sub_len;
     } else {
         rmt_fill_memory(channel, rmt_item, len_rem, 0);
+        RMTMEM.chan[channel].data32[len_rem].val = 0;
+        len_rem = 0;
+    }
+    rmt_tx_start(channel, true);
+    if(wait_tx_done) {
+        xSemaphoreTake(p_rmt->tx_sem, portMAX_DELAY);
+        xSemaphoreGive(p_rmt->tx_sem);
+    }
+    return ESP_OK;
+}
+
+esp_err_t rmt_write_bytes(rmt_channel_t channel, const uint8_t * bytes, int byte_count, rmt_item32_t low, rmt_item32_t high,  bool wait_tx_done)
+{
+    RMT_CHECK(channel < RMT_CHANNEL_MAX, RMT_CHANNEL_ERROR_STR, ESP_ERR_INVALID_ARG);
+    RMT_CHECK(p_rmt_obj[channel] != NULL, RMT_DRIVER_ERROR_STR, ESP_FAIL);
+    RMT_CHECK(bytes != NULL, RMT_ADDR_ERROR_STR, ESP_FAIL);
+    RMT_CHECK(byte_count > 0, RMT_DRIVER_LENGTH_ERROR_STR, ESP_ERR_INVALID_ARG);
+    rmt_obj_t* p_rmt = p_rmt_obj[channel];
+    int block_num = RMT.conf_ch[channel].conf0.mem_size;
+    int item_block_len = block_num * RMT_MEM_ITEM_NUM;
+    int item_sub_len = block_num * RMT_MEM_ITEM_NUM / 2;
+    int len_rem = byte_count << 3;
+    ESP_LOGD(RMT_TAG, "Total items for %d bytes is %d", byte_count, len_rem );
+    xSemaphoreTake(p_rmt->tx_sem, portMAX_DELAY);
+    // fill the memory block first
+    if(len_rem >= item_block_len) {
+        int byteLen = item_block_len >> 3;
+        ESP_LOGD(RMT_TAG, "Writing %d bytes per block", byteLen);
+        rmt_fill_byte_memory(channel, bytes, byteLen, 0, low, high);
+        RMT.tx_lim_ch[channel].limit = item_sub_len;
+        RMT.apb_conf.mem_tx_wrap_en = 1;
+        len_rem -= item_block_len;
+        RMT.conf_ch[channel].conf1.tx_conti_mode = 0;
+        rmt_set_tx_thr_intr_en(channel, 1, item_sub_len);
+        p_rmt->tx_byteData = bytes + byteLen;
+        p_rmt->tx_len_rem = len_rem;
+        p_rmt->tx_offset = 0;
+        p_rmt->tx_sub_len = item_sub_len;
+        p_rmt->tx_byteHigh = high;
+        p_rmt->tx_byteLow = low;
+    } else {
+        rmt_fill_byte_memory(channel, bytes, byte_count, 0, low, high);
         RMTMEM.chan[channel].data32[len_rem].val = 0;
         len_rem = 0;
     }
